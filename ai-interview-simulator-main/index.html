@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dynamic AI Interviewer</title>
+    <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+</head>
+<body class="bg-slate-900 text-slate-100 font-sans h-screen flex flex-col">
+
+    <header class="bg-slate-800 border-b border-slate-700 p-4 shadow-md">
+        <div class="max-w-4xl mx-auto space-y-3">
+            <div class="flex items-center gap-2">
+                <span class="text-2xl">💼</span>
+                <h1 class="text-lg font-bold tracking-wide text-emerald-400">Universal Interview Simulator</h1>
+            </div>
+            
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-3 text-sm">
+                <input id="company-input" type="text" placeholder="Company (e.g., Google, Netflix)" value="Google" class="bg-slate-900 border border-slate-600 rounded-lg px-3 py-2 text-slate-100 focus:outline-none focus:border-emerald-500">
+                <input id="position-input" type="text" placeholder="Position (e.g., Frontend Engineer)" value="Software Engineer" class="bg-slate-900 border border-slate-600 rounded-lg px-3 py-2 text-slate-100 focus:outline-none focus:border-emerald-500">
+                <input id="url-input" type="text" placeholder="Context URL (Blog, Wiki, JD)" value="https://www.levels.fyi/blog/google-interview-process.html" class="bg-slate-900 border border-slate-600 rounded-lg px-3 py-2 text-slate-100 focus:outline-none focus:border-emerald-500">
+            </div>
+            <p class="text-xs text-slate-400">Modify the fields above anytime. Your next message will use the updated configuration!</p>
+        </div>
+    </header>
+
+    <main id="chat-window" class="flex-1 overflow-y-auto p-4 md:p-6 space-y-4 max-w-4xl w-full mx-auto">
+        <div class="flex gap-3 max-w-[85%]">
+            <div class="w-8 h-8 rounded-full bg-emerald-600 flex items-center justify-center font-bold shadow">🤖</div>
+            <div class="bg-slate-800 rounded-2xl rounded-tl-none p-4 shadow border border-slate-700/50">
+                <p class="text-sm leading-relaxed text-slate-200">Welcome! Set your target company, position, and preparation link in the panel above, then type your opening greeting to begin.</p>
+            </div>
+        </div>
+    </main>
+
+    <div id="typing-indicator" class="hidden max-w-4xl w-full mx-auto px-4 md:px-6 pb-2 text-xs text-slate-400 flex items-center gap-2">
+        <span class="w-2 h-2 bg-emerald-400 rounded-full animate-bounce"></span>
+        <span class="w-2 h-2 bg-emerald-400 rounded-full animate-bounce [animation-delay:0.2s]"></span>
+        <span class="w-2 h-2 bg-emerald-400 rounded-full animate-bounce [animation-delay:0.4s]"></span>
+        <span>AI is thinking...</span>
+    </div>
+
+    <footer class="bg-slate-800 border-t border-slate-700 p-4 sticky bottom-0 shadow-lg">
+        <form id="chat-form" class="max-w-4xl w-full mx-auto flex gap-3">
+            <input type="text" id="user-input" autocomplete="off" placeholder="Type your response here..." class="flex-1 bg-slate-900 border border-slate-600 rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-emerald-500 text-slate-100 placeholder-slate-400 shadow-inner" />
+            <button type="submit" id="send-btn" class="bg-emerald-500 hover:bg-emerald-600 text-slate-900 font-bold px-6 py-3 rounded-xl text-sm tracking-wide transition shadow-md active:scale-95">Send</button>
+        </form>
+    </footer>
+
+    <script>
+        const chatWindow = document.getElementById('chat-window');
+        const chatForm = document.getElementById('chat-form');
+        const userInput = document.getElementById('user-input');
+        const typingIndicator = document.getElementById('typing-indicator');
+
+        const companyInput = document.getElementById('company-input');
+        const positionInput = document.getElementById('position-input');
+        const urlInput = document.getElementById('url-input');
+
+        function appendMessage(sender, text) {
+            const msgRow = document.createElement('div');
+            msgRow.className = `flex gap-3 max-w-[85%] ${sender === 'user' ? 'ml-auto flex-row-reverse' : ''}`;
+            
+            const avatar = document.createElement('div');
+            avatar.className = `w-8 h-8 rounded-full flex items-center justify-center font-bold shrink-0 ${sender === 'user' ? 'bg-slate-600' : 'bg-emerald-600'}`;
+            avatar.innerText = sender === 'user' ? '🧑‍💻' : '🤖';
+
+            const msgBubble = document.createElement('div');
+            msgBubble.className = `rounded-2xl p-4 shadow border ${sender === 'user' ? 'bg-emerald-500 text-slate-900 font-medium rounded-tr-none border-emerald-400' : 'bg-slate-800 text-slate-200 rounded-tl-none border-slate-700/50'}`;
+            msgBubble.innerHTML = `<p class="text-sm leading-relaxed">${text.replace(/\n/g, '<br>')}</p>`;
+
+            msgRow.appendChild(avatar);
+            msgRow.appendChild(msgBubble);
+            chatWindow.appendChild(msgRow);
+            chatWindow.scrollTop = chatWindow.scrollHeight;
+        }
+
+        chatForm.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const message = userInput.value.trim();
+            if (!message) return;
+
+            appendMessage('user', message);
+            userInput.value = '';
+
+            typingIndicator.classList.remove('hidden');
+            chatWindow.scrollTop = chatWindow.scrollHeight;
+
+            try {
+                const response = await fetch('/api/chat', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ 
+                        message: message,
+                        company: companyInput.value.trim(),
+                        position: positionInput.value.trim(),
+                        url: urlInput.value.trim()
+                    })
+                });
+
+                if (!response.ok) throw new Error('Server issue.');
+                const data = await response.json();
+                
+                typingIndicator.classList.add('hidden');
+                appendMessage('ai', data.reply);
+
+            } catch (error) {
+                typingIndicator.classList.add('hidden');
+                appendMessage('ai', '⚠️ Error: Could not talk to backend server.');
+                console.error(error);
+            }
+        });
+    </script>
+</body>
+</html>
