@@ -1,0 +1,363 @@
+"""
+Global Model Interpretability
+===========================================
+Produces global feature-importance analysis for the trained
+HistGradientBoostingClassifier using gain-based importance (extracted from
+the internal tree nodes) and SHAP / permutation-importance-based explanations.
+
+Outputs (saved to results/interpretability/)
+--------------------------------------------
+  feature_importance_gain.png     — gain-based bar chart (top 30)
+  shap_beeswarm.png               — SHAP beeswarm (or approx. beeswarm)
+  shap_bar.png                    — mean |SHAP| bar chart
+  shap_dependence_1_<name>.png    — dependence plot for rank #1 feature
+  ...
+  shap_dependence_5_<name>.png    — dependence plot for rank #5 feature
+  feature_narrative.txt           — plain-English narrative + regulatory check
+
+Usage
+-----
+    python scripts/explain_global.py
+"""
+
+from __future__ import annotations
+
+import gc
+import os
+import warnings
+from pathlib import Path
+
+import joblib
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+import scipy.sparse as sp
+
+from sklearn.inspection import permutation_importance
+from sklearn.metrics import roc_auc_score
+from custom_transformers import (
+    DaysEmployedAnomalyFixer,
+    OwnCarAgeImputer,
+    TimeVariableTransformer,
+    IncomeTransformer,
+)
+from utils import (
+    _print_header, _save_fig, _dense_float32, _stratified_sample
+)
+from feature_narative import write_feature_narrative
+
+warnings.filterwarnings("ignore")
+
+# ── SHAP (optional) ──────────────────────────────────────────────────────────
+try:
+    import shap
+    SHAP_AVAILABLE = True
+except ImportError:
+    SHAP_AVAILABLE = False
+
+# ── Paths ─────────────────────────────────────────────────────────────────────
+FEATURE_ENG_DIR = os.path.join("results", "feature_engineering")
+MODEL_DIR       = os.path.join("results", "model")
+INTERP_DIR      = os.path.join("results", "interpretability")
+CLIENTS_DIR     = os.path.join("results", "clients_outputs")
+
+for d in (INTERP_DIR, CLIENTS_DIR):
+    os.makedirs(d, exist_ok=True)
+
+# ── Config ────────────────────────────────────────────────────────────────────
+RANDOM_STATE    = 42
+N_SHAP_SAMPLES  = 2_000   # rows used for global SHAP computation
+N_PERM_SAMPLES  = 3_000   # rows used for permutation importance (fallback)
+N_PERM_REPEATS  = 5       # repeats for permutation importance
+
+
+# =============================================================================
+# STEP 1 — LOAD ARTEFACTS
+# =============================================================================
+
+def load_artifacts():
+    _print_header("Loading artefacts")
+
+    model    = joblib.load(os.path.join(MODEL_DIR, "my_own_model.pkl"))
+    pipeline = joblib.load(os.path.join(MODEL_DIR, "preprocessing_pipeline.pkl"))
+    X_train  = _dense_float32(
+        joblib.load(os.path.join(FEATURE_ENG_DIR, "X_train_processed.joblib"))
+    )
+    y_train  = np.asarray(
+        joblib.load(os.path.join(FEATURE_ENG_DIR, "y_train.joblib")),
+        dtype=np.int8,
+    )
+
+    mem_gb = X_train.nbytes / 1024**3
+    print(f"  X_train : {X_train.shape}  ({mem_gb:.2f} GB float32)")
+    print(f"  Positives: {y_train.mean():.2%}")
+    print(f"  SHAP library: {'available ✓' if SHAP_AVAILABLE else 'NOT installed — using permutation importance'}")
+
+    return model, pipeline, X_train, y_train
+
+
+# =============================================================================
+# STEP 2 — FEATURE NAMES
+# =============================================================================
+
+def get_feature_names(pipeline, n_features: int) -> np.ndarray:
+    """
+    Extract human-readable feature names from the fitted sklearn pipeline.
+
+    The ColumnTransformer produces names like 'num__AMT_CREDIT' for numeric
+    features and 'cat__NAME_CONTRACT_TYPE_Cash loans' for OHE categories.
+    We strip the prefix so plots are readable.
+    """
+    try:
+        ct    = pipeline.named_steps["preprocessor"]
+        names = ct.get_feature_names_out()
+        # Strip 'num__' / 'cat__' / 'remainder__' prefixes
+        cleaned = []
+        for n in names:
+            cleaned.append(n.split("__", 1)[1] if "__" in n else n)
+        print(f"  Feature names extracted: {len(cleaned)}")
+        return np.array(cleaned, dtype=object)
+    except Exception as exc:
+        print(f"  WARNING: could not extract feature names ({exc})")
+        return np.array([f"feat_{i}" for i in range(n_features)], dtype=object)
+
+
+# =============================================================================
+# STEP 3 — GAIN-BASED IMPORTANCE
+# =============================================================================
+
+def hgbc_gain_importance(model, n_features: int) -> np.ndarray:
+    """
+    Extract gain-based feature importance from HGBC internal tree nodes.
+
+    HistGradientBoostingClassifier does not expose feature_importances_
+    as a top-level attribute, but the split-gain for each internal node is
+    stored in model._predictors[i][0].nodes['gain'].  We sum gains across
+    all trees and all split nodes, then normalise to [0, 1].
+    """
+    gains = np.zeros(n_features, dtype=np.float64)
+    for iter_predictors in model._predictors:
+        for predictor in iter_predictors:
+            nodes = predictor.nodes
+            split_nodes = nodes[nodes["is_leaf"] == 0]
+            for node in split_nodes:
+                fi = int(node["feature_idx"])
+                if 0 <= fi < n_features:
+                    gains[fi] += max(0.0, float(node["gain"]))
+    total = gains.sum()
+    return gains / total if total > 0 else gains
+
+
+def plot_builtin_importance(model, feature_names: np.ndarray, top_n: int = 30):
+    """Bar chart of gain-based importance (top_n features)."""
+    _print_header("Gain-based feature importance")
+
+    n = min(model.n_iter_ and 1, 1)  # sanity
+    importances = hgbc_gain_importance(model, len(feature_names))
+
+    k     = min(top_n, len(importances))
+    idx   = np.argsort(importances)[-k:]
+    vals  = importances[idx]
+    names = feature_names[idx]
+
+    fig, ax = plt.subplots(figsize=(10, max(6, k * 0.32)))
+    palette = plt.cm.Blues(np.linspace(0.4, 0.9, k))
+    ax.barh(range(k), vals, color=palette, edgecolor="white", lw=0.4)
+    ax.set_yticks(range(k))
+    ax.set_yticklabels(names, fontsize=8)
+    ax.set_xlabel("Relative gain importance (normalised)")
+    ax.set_title(f"Top {k} Features — Gain-Based Importance\n"
+                 "HistGradientBoostingClassifier")
+    ax.grid(axis="x", alpha=0.3)
+    plt.tight_layout()
+    _save_fig(fig, "feature_importance_gain.png")
+
+    return importances
+
+
+# =============================================================================
+# STEP 4 — GLOBAL SHAP / PERMUTATION IMPORTANCE
+# =============================================================================
+
+def _compute_shap(model, X_sample, y_sample, feature_names):
+    """Compute SHAP values using TreeExplainer (requires shap package)."""
+    print(f"  Using shap.TreeExplainer on {len(X_sample)} samples …")
+    bg_n  = min(200, len(X_sample))
+    bg    = shap.sample(X_sample, bg_n, random_state=RANDOM_STATE)
+    explainer  = shap.TreeExplainer(model, bg)
+    shap_vals  = explainer.shap_values(X_sample)
+    if isinstance(shap_vals, list):
+        shap_vals = shap_vals[1]
+    base_val = explainer.expected_value
+    if isinstance(base_val, (list, np.ndarray)):
+        base_val = float(base_val[1])
+    return shap_vals.astype(np.float32), float(base_val)
+
+
+def compute_global_explanation(model, X_train, y_train, feature_names, gain_imp):
+    """Return shap_values, X_sample, y_sample, base_value, method_name."""
+    _print_header("Computing global explanations")
+
+    n = N_SHAP_SAMPLES if SHAP_AVAILABLE else N_PERM_SAMPLES
+    X_s, y_s = _stratified_sample(X_train, y_train, n)
+    print(f"  Sample: {len(X_s)} rows  |  positives: {y_s.mean():.2%}")
+
+    if SHAP_AVAILABLE:
+        sv, bv = _compute_shap(model, X_s, y_s, feature_names)
+        return sv, X_s, y_s, bv, "shap"
+    else:
+        print("Install shap and import for processing.\n")
+        exit
+
+
+# =============================================================================
+# STEP 5 — BEESWARM PLOT
+# =============================================================================
+
+def plot_beeswarm(shap_vals, X_sample, feature_names, method, top_n=20):
+    """
+    SHAP beeswarm plot:
+      y-axis  — feature ranked by mean |SHAP|
+      x-axis  — SHAP value (contribution to default probability)
+      colour  — feature value (blue=low, red=high)
+    """
+    _print_header("Beeswarm plot")
+
+    if SHAP_AVAILABLE and method == "shap":
+        shap.summary_plot(
+            shap_vals, X_sample,
+            feature_names=feature_names,
+            max_display=top_n,
+            show=False,
+            plot_type="dot",
+        )
+        fig = plt.gcf()
+        fig.set_size_inches(10, max(6, top_n * 0.38))
+        plt.tight_layout()
+        _save_fig(fig, "shap_beeswarm.png")
+        print("  SHAP beeswarm saved.")
+    else:
+        print("Import and install shap.\n")
+
+
+# =============================================================================
+# STEP 6 — BAR PLOT (mean |SHAP|)
+# =============================================================================
+
+def plot_shap_bar(shap_vals, feature_names, top_n=25):
+    """Mean absolute SHAP value bar chart ranked by global importance."""
+    _print_header("Mean |SHAP| bar plot")
+
+    n_feat  = min(len(feature_names), shap_vals.shape[1])
+    abs_imp = np.abs(shap_vals[:, :n_feat]).mean(axis=0)
+    mean_sv = shap_vals[:, :n_feat].mean(axis=0)          # for directionality
+
+    k   = min(top_n, n_feat)
+    idx = np.argsort(abs_imp)[-k:]
+    vals  = abs_imp[idx]
+    signs = np.sign(mean_sv[idx])
+    names = feature_names[idx]
+
+    colors = ["#e74c3c" if s > 0 else "#3498db" for s in signs]
+
+    fig, ax = plt.subplots(figsize=(10, max(6, k * 0.33)))
+    ax.barh(range(k), vals, color=colors, edgecolor="white", lw=0.4)
+    ax.set_yticks(range(k))
+    ax.set_yticklabels(names, fontsize=8)
+    ax.set_xlabel("Mean |SHAP value| (average impact on model output)")
+    ax.set_title(f"Top {k} Features — Global SHAP Importance\n"
+                 "Red = on average increases default risk, Blue = decreases")
+
+    legend = [
+        mpatches.Patch(color="#e74c3c", label="Avg direction: increases risk"),
+        mpatches.Patch(color="#3498db", label="Avg direction: decreases risk"),
+    ]
+    ax.legend(handles=legend, fontsize=8)
+    ax.grid(axis="x", alpha=0.3)
+    plt.tight_layout()
+    _save_fig(fig, "shap_bar.png")
+
+    return idx, abs_imp
+
+
+# =============================================================================
+# STEP 7 — DEPENDENCE PLOTS  (top 5 features)
+# =============================================================================
+
+def plot_dependence_plots(shap_vals, X_sample, feature_names, top_n=5):
+    """
+    Scatter of feature value vs. SHAP value for the top-n most important features.
+    Reveals non-linear effects and interaction patterns.
+    """
+    _print_header("Dependence plots (top 5 features)")
+
+    n_feat  = min(len(feature_names), shap_vals.shape[1])
+    abs_imp = np.abs(shap_vals[:, :n_feat]).mean(axis=0)
+    top_idx = np.argsort(abs_imp)[-top_n:][::-1]
+
+    for rank, fi in enumerate(top_idx, 1):
+        fname  = feature_names[fi]
+        fvals  = X_sample[:, fi]
+        sv     = shap_vals[:, fi]
+        abs_lim = float(np.abs(sv).max())
+
+        fig, ax = plt.subplots(figsize=(8, 5))
+        sc = ax.scatter(
+            fvals, sv,
+            c=sv, cmap="RdBu_r",
+            alpha=0.35, s=10,
+            vmin=-abs_lim, vmax=abs_lim,
+        )
+        plt.colorbar(sc, ax=ax, label="SHAP value")
+        ax.axhline(0, color="black", lw=0.8, ls="--")
+        ax.set_xlabel(fname, fontsize=11)
+        ax.set_ylabel("SHAP value  (contribution to default probability)")
+        ax.set_title(
+            f"SHAP Dependence Plot — {fname}\n"
+            f"Rank #{rank} by mean |SHAP|  "
+            f"(positive SHAP = higher default risk)"
+        )
+        ax.grid(alpha=0.2)
+        plt.tight_layout()
+
+        safe_name = fname[:30].replace("/", "_").replace(" ", "_")
+        _save_fig(fig, f"shap_dependence_{rank}_{safe_name}.png")
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+def run_global_interpretability():
+    model, pipeline, X_train, y_train = load_artifacts()
+    feature_names = get_feature_names(pipeline, X_train.shape[1])
+
+    # Gain-based importance 
+    gain_imp = plot_builtin_importance(model, feature_names)
+    gc.collect()
+
+    # Global SHAP / permutation proxy 
+    shap_vals, X_sample, y_sample, base_val, method = compute_global_explanation(
+        model, X_train, y_train, feature_names, gain_imp
+    )
+    del X_train, y_train
+    gc.collect()
+
+    plot_beeswarm(shap_vals, X_sample, feature_names, method)
+    plot_shap_bar(shap_vals, feature_names)
+    plot_dependence_plots(shap_vals, X_sample, feature_names)
+    write_feature_narrative(shap_vals, feature_names)
+
+    del shap_vals, X_sample, y_sample
+    gc.collect()
+
+    _print_header("Global interpretability complete")
+    print(f"  All plots  → {INTERP_DIR}/")
+    print(f"  Narrative  → {INTERP_DIR}/feature_narrative.txt")
+
+
+if __name__ == "__main__":
+    run_global_interpretability()
